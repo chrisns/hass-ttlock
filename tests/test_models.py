@@ -236,6 +236,27 @@ class TestLock:
         )
         assert lock.lockSound == expected
 
+    def test_ble_control_credentials_parse(self):
+        # The fields BLE control needs beyond aesKeyStr: the obfuscated per-key
+        # secret (lockKey) and the key flag generation (lockFlagPos). adminPwd is
+        # captured under the historical attribute name noKeyPwd.
+        lock = Lock.model_validate(
+            {
+                **MINIMAL_LOCK,
+                "lockKey": "obfuscated-lock-key",
+                "lockFlagPos": 5,
+                "adminPwd": "obfuscated-admin-pwd",
+            }
+        )
+        assert lock.lockKey == "obfuscated-lock-key"
+        assert lock.lockFlagPos == 5
+        assert lock.noKeyPwd == "obfuscated-admin-pwd"
+
+    def test_lock_flag_pos_defaults_to_zero(self):
+        lock = Lock.model_validate({**MINIMAL_LOCK})
+        assert lock.lockFlagPos == 0
+        assert lock.lockKey is None
+
 
 class TestCard:
     def test_permanent_card_has_no_dates(self):

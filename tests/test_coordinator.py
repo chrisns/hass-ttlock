@@ -3,7 +3,7 @@
 import asyncio
 from datetime import timedelta
 from types import MappingProxyType
-from unittest.mock import AsyncMock, Mock, PropertyMock
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 import dateparser
 import pytest
@@ -13,10 +13,11 @@ from pytest_homeassistant.common import (
 )
 
 from custom_components.ttlock.api import RequestFailed, TTLockApi
-from custom_components.ttlock.ble import BleData
+from custom_components.ttlock.ble import BleData, BleError
 from custom_components.ttlock.ble_protocol import LockStatus
 from custom_components.ttlock.capture import LockTrafficCapture
 from custom_components.ttlock.const import (
+    CONF_BLE_CONTROL,
     CONF_BLUETOOTH_ENABLED,
     CONF_POLL_INTERVAL,
     CONF_SLOW_POLL_INTERVAL,
@@ -52,6 +53,8 @@ from .const import (
     LOCK_STATE_LOCKED,
     LOCK_STATE_UNKNOWN,
     LOCK_STATE_UNLOCKED,
+    MOCK_LOCK_AES_KEY,
+    MOCK_LOCK_VERSION,
     PASSAGE_MODE_6_TO_6_7_DAYS,
     PASSAGE_MODE_ALL_DAY_WEEKDAYS,
     WEBHOOK_LOCK_10AM_UTC,
@@ -2083,3 +2086,121 @@ class TestGatewaysUpdateCoordinator:
 
         with pytest.raises(UpdateFailed):
             await gateways_coordinator._async_update_data()
+
+
+class TestBleFirstControl:
+    """lock()/unlock() drive the bolt over Bluetooth first, cloud as fallback.
+
+    The routing (option gate, reachability, credential check, fallback) is what
+    these cover; the wire protocol itself is tested in test_ble_protocol.py and
+    the session in test_ble.py, so async_control is patched out here.
+    """
+
+    def _coordinator(self, hass, api, monkeypatch, *, control=True, reachable=True):
+        # The api fixture has no OAuth session; uid would read from the token.
+        monkeypatch.setattr(TTLockApi, "uid", 7, raising=False)
+        options = {CONF_BLUETOOTH_ENABLED: True, CONF_BLE_CONTROL: control}
+        entry = MockConfigEntry(domain=DOMAIN, options=options)
+        entry.add_to_hass(hass)
+        summary = LockSummary(
+            lockId=7252408,
+            lockAlias="Test Lock",
+            lockMac="00:00:00:00:00:00",
+            hasGateway=1,
+            userType="110301",
+        )
+        coord = LockUpdateCoordinator(
+            hass, entry, api, summary, LockTrafficCapture(), LockStateStore(hass)
+        )
+        # Credentials as a slow-tier detail fetch would have left them.
+        coord._ble_version = MOCK_LOCK_VERSION
+        coord._ble_key = MOCK_LOCK_AES_KEY
+        coord._ble_unlock_key = "2345"
+        coord._ble_lock_flag_pos = 0
+        if reachable:
+            coord.ble = BleData(rssi=-55, connectable=True)
+        return coord
+
+    async def test_unlock_prefers_bluetooth(
+        self, hass, api, mock_bluetooth, monkeypatch
+    ):
+        coord = self._coordinator(hass, api, monkeypatch)
+        coord.data.locked = True
+        cloud = AsyncMock(return_value=True)
+        monkeypatch.setattr(coord.api, "unlock", cloud)
+        with patch(
+            "custom_components.ttlock.coordinator.async_control",
+            new=AsyncMock(return_value=None),
+        ) as ble_control:
+            await coord.unlock()
+
+        ble_control.assert_awaited_once()
+        assert ble_control.await_args is not None
+        assert ble_control.await_args.kwargs["unlock"] is True
+        cloud.assert_not_called()
+        assert coord.data.locked is False
+
+    async def test_lock_prefers_bluetooth(self, hass, api, mock_bluetooth, monkeypatch):
+        coord = self._coordinator(hass, api, monkeypatch)
+        coord.data.locked = False
+        cloud = AsyncMock(return_value=True)
+        monkeypatch.setattr(coord.api, "lock", cloud)
+        with patch(
+            "custom_components.ttlock.coordinator.async_control",
+            new=AsyncMock(return_value=None),
+        ) as ble_control:
+            await coord.lock()
+
+        assert ble_control.await_args is not None
+        assert ble_control.await_args.kwargs["unlock"] is False
+        cloud.assert_not_called()
+        assert coord.data.locked is True
+
+    async def test_a_bluetooth_failure_falls_back_to_the_cloud(
+        self, hass, api, mock_bluetooth, monkeypatch
+    ):
+        coord = self._coordinator(hass, api, monkeypatch)
+        coord.data.locked = True
+        cloud = AsyncMock(return_value=True)
+        monkeypatch.setattr(coord.api, "unlock", cloud)
+        with patch(
+            "custom_components.ttlock.coordinator.async_control",
+            new=AsyncMock(side_effect=BleError("out of range mid-command")),
+        ):
+            await coord.unlock()
+
+        cloud.assert_awaited_once()
+        assert coord.data.locked is False
+
+    async def test_option_off_uses_the_cloud(
+        self, hass, api, mock_bluetooth, monkeypatch
+    ):
+        coord = self._coordinator(hass, api, monkeypatch, control=False)
+        coord.data.locked = True
+        cloud = AsyncMock(return_value=True)
+        monkeypatch.setattr(coord.api, "unlock", cloud)
+        with patch(
+            "custom_components.ttlock.coordinator.async_control",
+            new=AsyncMock(return_value=None),
+        ) as ble_control:
+            await coord.unlock()
+
+        ble_control.assert_not_called()
+        cloud.assert_awaited_once()
+        assert coord.data.locked is False
+
+    async def test_out_of_range_uses_the_cloud(
+        self, hass, api, mock_bluetooth, monkeypatch
+    ):
+        coord = self._coordinator(hass, api, monkeypatch, reachable=False)
+        coord.data.locked = True
+        cloud = AsyncMock(return_value=True)
+        monkeypatch.setattr(coord.api, "unlock", cloud)
+        with patch(
+            "custom_components.ttlock.coordinator.async_control",
+            new=AsyncMock(return_value=None),
+        ) as ble_control:
+            await coord.unlock()
+
+        ble_control.assert_not_called()
+        cloud.assert_awaited_once()

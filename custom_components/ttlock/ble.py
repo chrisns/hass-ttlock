@@ -27,6 +27,10 @@ from .ble_protocol import (
     FrameAssembler,
     LockStatus,
     LockVersion,
+    Response,
+    check_user_time_data,
+    control_data,
+    token_from_response,
 )
 
 if TYPE_CHECKING:
@@ -64,6 +68,15 @@ class BleConnectionError(BleError):
 
 class BleNoResponse(BleError):
     """The lock took a command and never answered."""
+
+
+class BleControlRejected(BleError):
+    """The lock answered a lock/unlock command but refused to act on it.
+
+    A clean "no" from the lock - wrong key, a key outside its validity window,
+    or a lockFlagPos it treats as reset - not a radio failure. Distinct so the
+    caller can tell "the lock said no" from "we could not reach the lock."
+    """
 
 
 @dataclass
@@ -357,3 +370,45 @@ async def async_read_status(
     async with async_command_session(hass, address, name, version, aes_key) as session:
         reply = await session.execute(Command.QUERY_LOCK_STATUS)
     return LockStatus.parse(reply.data)
+
+
+async def async_control(
+    hass: HomeAssistant,
+    address: str,
+    name: str,
+    version: LockVersion,
+    aes_key: bytes,
+    unlock_key: str | int,
+    uid: int,
+    lock_flag_pos: int,
+    *,
+    unlock: bool,
+) -> None:
+    """Lock or unlock the bolt over one short authenticated session.
+
+    Runs the per-key handshake (CHECK_USER_TIME, whose reply carries the
+    psFromLock token) then the control command, both encrypted with the lock's
+    AES key. Unlike `async_read_status` this changes physical state, so it is
+    only ever called from an explicit lock/unlock, never the poll.
+
+    Raises:
+        BleError: if the lock could not be reached, did not answer, or rejected
+            the handshake - the caller falls back to the cloud.
+        BleControlRejected: if the lock answered the control command but
+            declined to act.
+        ProtocolError: if a reply could not be parsed (e.g. the handshake
+            token was missing).
+    """
+    action = "unlock" if unlock else "lock"
+    command = Command.UNLOCK if unlock else Command.LOCK
+    async with async_command_session(hass, address, name, version, aes_key) as session:
+        handshake = await session.execute(
+            Command.CHECK_USER_TIME, check_user_time_data(uid, lock_flag_pos)
+        )
+        token = token_from_response(handshake.data)
+        reply = await session.execute(command, control_data(token, unlock_key))
+
+    if not Response.parse(reply.data).succeeded:
+        raise BleControlRejected(
+            f"{name} refused to {action} over Bluetooth (reply {reply.data.hex()})"
+        )

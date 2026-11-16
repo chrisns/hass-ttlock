@@ -138,6 +138,16 @@ class TTLockApi:
 
         return self._oauth_session.token["access_token"]
 
+    @property
+    def uid(self) -> int:
+        """The authenticated account's TTLock user id.
+
+        oauth2/getAccessToken returns it beside the tokens; the BLE handshake
+        embeds it in CHECK_USER_TIME and CHECK_ADMIN. 0 when the token predates
+        this being read, in which case the lock decides whether 0 is accepted.
+        """
+        return int(self._oauth_session.token.get("uid", 0) or 0)
+
     async def _add_auth(self, **kwargs) -> dict:
         kwargs["clientId"] = self._oauth_session.implementation.client_id  # ty: ignore[unresolved-attribute] - implementation is a TTLockAuthImplementation
         kwargs["accessToken"] = await self.async_get_access_token()

@@ -132,11 +132,18 @@ class Lock(LockMacModel):
     date: int
     # Protocol dialect every BLE frame echoes back, see ble_protocol.LockVersion.
     lockVersion: dict[str, int] | None = None
+    # The key's flag generation. CHECK_USER_TIME / CHECK_ADMIN must not send a
+    # lower value (the lock reads a lower one as a reset key and refuses it);
+    # 0 on a freshly paired key. Not sensitive.
+    lockFlagPos: int = 0
 
     # sensitive fields
     noKeyPwd: str = Field(alias="adminPwd")
     # Per-lock AES key BLE frames are encrypted with. Undocumented, redacted.
     aesKeyStr: str | None = None
+    # Per-key secret proving "this key" on every write, cloud-obfuscated;
+    # ble_protocol.decode_password recovers the numeric form. Redacted.
+    lockKey: str | None = None
 
 
 class LockSummary(LockMacModel):

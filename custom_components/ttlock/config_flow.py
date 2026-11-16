@@ -26,11 +26,13 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_BLE_CONTROL,
     CONF_BLUETOOTH_ENABLED,
     CONF_POLL_INTERVAL,
     CONF_REGION,
     CONF_SLOW_POLL_INTERVAL,
     CONF_WEBHOOK_URL,
+    DEFAULT_BLE_CONTROL,
     DEFAULT_BLUETOOTH_ENABLED,
     DEFAULT_POLL_INTERVAL_MINUTES,
     DEFAULT_REGION,
@@ -210,6 +212,10 @@ class TTLockOptionsFlow(OptionsFlow):
                         default=options.get(
                             CONF_BLUETOOTH_ENABLED, DEFAULT_BLUETOOTH_ENABLED
                         ),
+                    ): BooleanSelector(),
+                    vol.Required(
+                        CONF_BLE_CONTROL,
+                        default=options.get(CONF_BLE_CONTROL, DEFAULT_BLE_CONTROL),
                     ): BooleanSelector(),
                 }
             ),

@@ -34,15 +34,24 @@ from .ble import (
     BleData,
     BleError,
     async_bluetooth_available,
+    async_control,
     async_read_status,
     async_track_address,
 )
-from .ble_protocol import LockStatus, LockVersion, ProtocolError, parse_aes_key
+from .ble_protocol import (
+    LockStatus,
+    LockVersion,
+    ProtocolError,
+    decode_password,
+    parse_aes_key,
+)
 from .capture import LockTrafficCapture
 from .const import (
+    CONF_BLE_CONTROL,
     CONF_BLUETOOTH_ENABLED,
     CONF_POLL_INTERVAL,
     CONF_SLOW_POLL_INTERVAL,
+    DEFAULT_BLE_CONTROL,
     DEFAULT_BLUETOOTH_ENABLED,
     DEFAULT_POLL_INTERVAL_MINUTES,
     DEFAULT_SLOW_POLL_INTERVAL_HOURS,
@@ -293,6 +302,11 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
         # the poll.
         self._ble_version: dict[str, int] | None = None
         self._ble_key: str | None = None
+        # Extra credentials needed to CHANGE state (not just read it): the
+        # obfuscated per-key secret and the key's flag generation. Decoded on
+        # use, like the AES key.
+        self._ble_unlock_key: str | None = None
+        self._ble_lock_flag_pos: int = 0
 
         # Whether we've already made this restart's one-shot door-sensor
         # recheck (see _check_for_sensor) - deliberately in-memory, not
@@ -317,6 +331,9 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
         self._slow_interval = timedelta(hours=slow_hours)
         self._ble_option: bool = options.get(
             CONF_BLUETOOTH_ENABLED, DEFAULT_BLUETOOTH_ENABLED
+        )
+        self._ble_control_option: bool = options.get(
+            CONF_BLE_CONTROL, DEFAULT_BLE_CONTROL
         )
         self._details_last_fetched: datetime | None = None
         self._passage_last_fetched: datetime | None = None
@@ -463,6 +480,15 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
         return self._ble_option and async_bluetooth_available(self.hass)
 
     @property
+    def ble_control_enabled(self) -> bool:
+        """Whether to try driving the bolt over Bluetooth before the cloud.
+
+        Gated on the radio being on too: controlling the lock locally is
+        pointless without it, and the option has no effect on its own.
+        """
+        return self.ble_enabled and self._ble_control_option
+
+    @property
     def ble_reachable(self) -> bool:
         """Whether the local radio can reach the lock right now."""
         if not self._ble_option:
@@ -607,6 +633,60 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
         self._ble_verified_at = dt_util.utcnow()
         return status
 
+    def _ble_control_credentials(
+        self,
+    ) -> tuple[LockVersion, bytes, str, int, int] | None:
+        """Everything a local lock/unlock needs, or None if any of it is missing.
+
+        On top of the read credentials this adds the decoded unlockKey, the
+        account uid and the key's lockFlagPos. Returns None rather than a
+        partial tuple so a caller can only ever send a complete, valid command.
+        """
+        read = self._ble_credentials()
+        if read is None or self._ble_unlock_key is None:
+            return None
+        version, aes_key = read
+        with suppress(ValueError):
+            unlock_key = decode_password(self._ble_unlock_key)
+            return version, aes_key, unlock_key, self.api.uid, self._ble_lock_flag_pos
+        return None
+
+    async def async_control_ble(self, *, unlock: bool) -> bool:
+        """Try to lock/unlock over Bluetooth; return True only if the lock acted.
+
+        Never raises: a local failure (out of range, no answer, or the lock
+        declining) returns False so the caller falls back to the cloud. A clean
+        success refreshes the reachability stamp, same as a local read.
+        """
+        if not self.ble_control_enabled or not self.ble_reachable:
+            return False
+        credentials = self._ble_control_credentials()
+        if credentials is None:
+            return False
+        version, aes_key, unlock_key, uid, lock_flag_pos = credentials
+        try:
+            await async_control(
+                self.hass,
+                self.data.mac,
+                self.data.name,
+                version,
+                aes_key,
+                unlock_key,
+                uid,
+                lock_flag_pos,
+                unlock=unlock,
+            )
+        except (BleError, ProtocolError) as err:
+            _LOGGER.warning(
+                "Local %s of lock %s failed (%s); falling back to the cloud",
+                "unlock" if unlock else "lock",
+                self.lock_id,
+                err,
+            )
+            return False
+        self._ble_verified_at = dt_util.utcnow()
+        return True
+
     async def _async_update_data(self) -> LockState:
         if not self.connectable:
             raise UpdateFailed(
@@ -641,6 +721,8 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
                 new_data.lock_sound = bool(details.lockSound)
                 self._ble_version = details.lockVersion
                 self._ble_key = details.aesKeyStr
+                self._ble_unlock_key = details.lockKey
+                self._ble_lock_flag_pos = details.lockFlagPos
                 self._details_last_fetched = now
 
             if Features.door_sensor in new_data.features:
@@ -1018,6 +1100,7 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
             "connectable": self.connectable,
             "cloud_connectable": self.cloud_connectable,
             "ble_enabled": self.ble_enabled,
+            "ble_control_enabled": self.ble_control_enabled,
             "ble_reachable": self.ble_reachable,
             "ble_proven": self.ble_proven,
             "has_gateway": self.has_gateway,
@@ -1043,15 +1126,21 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
         }
 
     async def lock(self) -> None:
-        """Try to lock the lock."""
+        """Lock the lock, over Bluetooth first when enabled, else the cloud."""
         with lock_action(self):
+            if await self.async_control_ble(unlock=False):
+                self.data.locked = True
+                return
             res = await self.api.lock(self.lock_id)
             if res:
                 self.data.locked = True
 
     async def unlock(self) -> None:
-        """Try to unlock the lock."""
+        """Unlock the lock, over Bluetooth first when enabled, else the cloud."""
         with lock_action(self):
+            if await self.async_control_ble(unlock=True):
+                self.data.locked = False
+                return
             res = await self.api.unlock(self.lock_id)
             if res:
                 self.data.locked = False

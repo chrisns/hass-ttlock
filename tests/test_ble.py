@@ -25,12 +25,14 @@ from custom_components.ttlock import ble
 from custom_components.ttlock.api import RequestFailed
 from custom_components.ttlock.ble import (
     BleConnectionError,
+    BleControlRejected,
     BleData,
     BleError,
     BleNoResponse,
     BleNotInRange,
     async_bluetooth_available,
     async_command_session,
+    async_control,
     async_read_status,
     async_track_address,
 )
@@ -41,6 +43,7 @@ from custom_components.ttlock.ble_protocol import (
     Command,
     Frame,
     LockVersion,
+    ProtocolError,
     parse_aes_key,
 )
 from custom_components.ttlock.capture import LockTrafficCapture
@@ -1065,3 +1068,194 @@ class TestCoordinatorBleProof:
         await hass.async_block_till_done()
 
         assert read_locally.update_interval == RETRY_INTERVAL
+
+
+# Handshake + control reply fixtures: a CHECK_USER_TIME reply carrying a known
+# psFromLock token, then a success/refusal on the control command itself. The
+# token is distinctive so the folded secret in the control frame is checkable.
+_HANDSHAKE_TOKEN = 1000
+_UNLOCK_KEY = "2345"
+_UID = 7
+
+
+def _handshake_reply(echo: int, token: int) -> bytes:
+    return bytes([echo, 0x01]) + token.to_bytes(4, "big")
+
+
+class TestAsyncControl:
+    """Locking and unlocking over one authenticated session."""
+
+    @pytest.fixture
+    def ready_to_unlock(self, speaking_lock, aes_key):
+        speaking_lock.answer(
+            Command.RESPONSE,
+            _handshake_reply(Command.CHECK_USER_TIME, _HANDSHAKE_TOKEN),
+            key=aes_key,
+            to=Command.CHECK_USER_TIME,
+        )
+        speaking_lock.answer(
+            Command.RESPONSE,
+            bytes([Command.UNLOCK, 0x01]),
+            key=aes_key,
+            to=Command.UNLOCK,
+        )
+        speaking_lock.answer(
+            Command.RESPONSE, bytes([Command.LOCK, 0x01]), key=aes_key, to=Command.LOCK
+        )
+        return speaking_lock
+
+    def _control_frame(self, lock, aes_key, opcode):
+        for raw in lock.gatt.received:
+            frame = Frame.decode(raw, aes_key=aes_key)
+            if frame.command == opcode:
+                return frame
+        raise AssertionError(f"no {opcode:#x} frame was sent")
+
+    async def test_unlock_runs_the_handshake_then_unlocks(
+        self, hass, mock_bluetooth, ready_to_unlock, lock_version, aes_key
+    ):
+        await async_control(
+            hass,
+            LOCK_MAC,
+            LOCK_NAME,
+            lock_version,
+            aes_key,
+            _UNLOCK_KEY,
+            _UID,
+            0,
+            unlock=True,
+        )
+
+        asked = [frame.command for frame in ready_to_unlock.asked]
+        assert asked == [Command.CHECK_USER_TIME, Command.UNLOCK]
+
+    async def test_control_frame_folds_the_token_into_the_unlock_key(
+        self, hass, mock_bluetooth, ready_to_unlock, lock_version, aes_key
+    ):
+        await async_control(
+            hass,
+            LOCK_MAC,
+            LOCK_NAME,
+            lock_version,
+            aes_key,
+            _UNLOCK_KEY,
+            _UID,
+            0,
+            unlock=True,
+        )
+
+        frame = self._control_frame(ready_to_unlock, aes_key, Command.UNLOCK)
+        expected = (_HANDSHAKE_TOKEN + int(_UNLOCK_KEY)) & 0xFFFFFFFF
+        assert frame.data[0:4] == expected.to_bytes(4, "big")
+        assert len(frame.data) == 8  # folded secret + timestamp
+
+    async def test_check_user_time_carries_uid_and_flag_pos(
+        self, hass, mock_bluetooth, ready_to_unlock, lock_version, aes_key
+    ):
+        await async_control(
+            hass,
+            LOCK_MAC,
+            LOCK_NAME,
+            lock_version,
+            aes_key,
+            _UNLOCK_KEY,
+            _UID,
+            0x0A,
+            unlock=True,
+        )
+
+        frame = self._control_frame(ready_to_unlock, aes_key, Command.CHECK_USER_TIME)
+        assert frame.data[10:13] == bytes([0, 0, 0x0A])  # lockFlagPos
+        assert frame.data[13:17] == _UID.to_bytes(4, "big")
+
+    async def test_lock_uses_the_lock_opcode(
+        self, hass, mock_bluetooth, ready_to_unlock, lock_version, aes_key
+    ):
+        await async_control(
+            hass,
+            LOCK_MAC,
+            LOCK_NAME,
+            lock_version,
+            aes_key,
+            _UNLOCK_KEY,
+            _UID,
+            0,
+            unlock=False,
+        )
+
+        asked = [frame.command for frame in ready_to_unlock.asked]
+        assert asked == [Command.CHECK_USER_TIME, Command.LOCK]
+
+    async def test_a_refused_command_raises_rejected(
+        self, hass, mock_bluetooth, speaking_lock, lock_version, aes_key
+    ):
+        speaking_lock.answer(
+            Command.RESPONSE,
+            _handshake_reply(Command.CHECK_USER_TIME, _HANDSHAKE_TOKEN),
+            key=aes_key,
+            to=Command.CHECK_USER_TIME,
+        )
+        # status byte 0x00: the lock answered but declined to act.
+        speaking_lock.answer(
+            Command.RESPONSE,
+            bytes([Command.UNLOCK, 0x00]),
+            key=aes_key,
+            to=Command.UNLOCK,
+        )
+
+        with pytest.raises(BleControlRejected):
+            await async_control(
+                hass,
+                LOCK_MAC,
+                LOCK_NAME,
+                lock_version,
+                aes_key,
+                _UNLOCK_KEY,
+                _UID,
+                0,
+                unlock=True,
+            )
+
+    async def test_a_failed_handshake_raises(
+        self, hass, mock_bluetooth, speaking_lock, lock_version, aes_key
+    ):
+        # CHECK_USER_TIME itself rejected: no token, so never reaches the bolt.
+        speaking_lock.answer(
+            Command.RESPONSE,
+            bytes([Command.CHECK_USER_TIME, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            key=aes_key,
+            to=Command.CHECK_USER_TIME,
+        )
+
+        with pytest.raises(ProtocolError):
+            await async_control(
+                hass,
+                LOCK_MAC,
+                LOCK_NAME,
+                lock_version,
+                aes_key,
+                _UNLOCK_KEY,
+                _UID,
+                0,
+                unlock=True,
+            )
+        # the bolt command was never sent
+        assert all(frame.command != Command.UNLOCK for frame in speaking_lock.asked)
+
+    async def test_closes_the_connection(
+        self, hass, mock_bluetooth, ready_to_unlock, lock_version, aes_key
+    ):
+        await async_control(
+            hass,
+            LOCK_MAC,
+            LOCK_NAME,
+            lock_version,
+            aes_key,
+            _UNLOCK_KEY,
+            _UID,
+            0,
+            unlock=True,
+        )
+
+        assert ready_to_unlock.gatt.notify_stops == [NOTIFY_UUID]
+        assert ready_to_unlock.gatt.disconnects == 1

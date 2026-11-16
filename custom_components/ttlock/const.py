@@ -49,6 +49,13 @@ DEFAULT_SLOW_POLL_INTERVAL_HOURS = 6
 CONF_BLUETOOTH_ENABLED = "bluetooth_enabled"
 DEFAULT_BLUETOOTH_ENABLED = True
 
+# Drive the bolt over Bluetooth first, falling back to the cloud. Off by
+# default: it needs the lock in connectable range and spends none of the
+# reliability margin a gateway/WiFi path has, so it is opt-in. Requires
+# CONF_BLUETOOTH_ENABLED; with the radio off this has no effect.
+CONF_BLE_CONTROL = "ble_control"
+DEFAULT_BLE_CONTROL = False
+
 SIGNAL_NEW_DATA = f"{DOMAIN}.data_received"
 
 DEVICE_LOGGER_PREFIX = f"{__package__}.device."

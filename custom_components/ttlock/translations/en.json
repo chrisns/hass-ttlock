@@ -42,12 +42,14 @@
         "data": {
           "poll_interval": "Poll interval",
           "slow_poll_interval": "Detail refresh interval",
-          "bluetooth_enabled": "Read locks over Bluetooth"
+          "bluetooth_enabled": "Read locks over Bluetooth",
+          "ble_control": "Control locks over Bluetooth"
         },
         "data_description": {
           "poll_interval": "How often to re-check whether each lock is locked or unlocked, in minutes.",
           "slow_poll_interval": "How often to refresh slow-changing detail (battery, name, autolock and passage-mode config, gateway signal), in hours.",
-          "bluetooth_enabled": "Read lock state directly from a lock in range of Home Assistant, instead of asking the TTLock cloud. Turn this off to use the cloud only."
+          "bluetooth_enabled": "Read lock state directly from a lock in range of Home Assistant, instead of asking the TTLock cloud. Turn this off to use the cloud only.",
+          "ble_control": "Lock and unlock directly over Bluetooth when the lock is in range, falling back to the TTLock cloud otherwise. Needs \"Read locks over Bluetooth\" on. Lets the lock work without the cloud, but only while it is in Bluetooth range."
         }
       }
     }
