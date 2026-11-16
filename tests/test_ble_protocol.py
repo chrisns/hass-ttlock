@@ -33,13 +33,21 @@ from custom_components.ttlock.ble_protocol import (
     FrameError,
     LockStatus,
     LockVersion,
+    ProtocolError,
     Response,
     UnsupportedProtocol,
+    check_admin_data,
+    check_random_data,
+    check_user_time_data,
+    control_data,
     crc8_maxim,
+    decimal_time_bytes,
+    decode_password,
     decrypt,
     encrypt,
     feature_value_bytes,
     parse_aes_key,
+    token_from_response,
 )
 
 from .const import MOCK_LOCK_VERSION
@@ -590,3 +598,114 @@ class TestFeatureValueBytes:
     def test_anything_unexpected_turns_the_check_off(self, value):
         """Empty disables the comparison; raising would fail a dump over it."""
         assert feature_value_bytes(value) == b""
+
+
+# --- Authenticated control: handshake, lock/unlock, credential decode --------
+
+
+class TestControlOpcodes:
+    """The opcodes added for control match the protocol's own numbering."""
+
+    def test_opcode_values(self) -> None:
+        # Interface facts: the numbers the lock's firmware dispatches on.
+        assert Command.CHECK_USER_TIME == 0x55
+        assert Command.CHECK_ADMIN == 0x41
+        assert Command.CHECK_RANDOM == 0x30
+        assert Command.UNLOCK == 0x47
+        assert Command.LOCK == 0x58
+
+
+class TestDecimalTimeBytes:
+    """Dates are decimal-per-byte, not BCD and not raw hex."""
+
+    def test_pairs_are_decimal_valued(self) -> None:
+        # "26" is the value 26 (0x1A), the lock reading it as a calendar field.
+        assert decimal_time_bytes("26") == bytes([26])
+        assert decimal_time_bytes("2611301400") == bytes([26, 11, 30, 14, 0])
+
+    def test_odd_length_is_left_padded(self) -> None:
+        assert decimal_time_bytes("5") == bytes([5])
+
+
+class TestDecodePassword:
+    """`lockKey` / `adminPwd` decode: table-driven one-byte XOR over base64/CSV."""
+
+    def test_hand_computed_vector(self) -> None:
+        # External anchor, worked by hand against the codec table rather than
+        # through the implementation:
+        #   plaintext "246" = bytes 0x32 0x34 0x36, chosen xor constant C=0x0A.
+        #   encoded length 4 -> table index (4-1)=3 -> table[3]=0xE2.
+        #   last byte   = table[3] ^ C      = 0xE2 ^ 0x0A = 0xE8 = 232
+        #   body bytes  = [p ^ C for p ...] = 0x38 0x3E 0x3C = 56 62 60
+        # so the wire field is base64("56,62,60,232") and must decode to "246".
+        field = base64.b64encode(b"56,62,60,232").decode("ascii")
+        assert decode_password(field) == "246"
+
+    def test_short_field_passes_through(self) -> None:
+        # The official client treats a field of 10 chars or fewer as plain.
+        assert decode_password("2486") == "2486"
+        assert decode_password("") == ""
+
+    def test_garbage_raises(self) -> None:
+        with pytest.raises(ValueError):
+            decode_password("not base64 but certainly longer than ten chars!!")
+
+
+class TestHandshakePayloads:
+    """Wire layouts asserted against the documented SDK field offsets."""
+
+    def test_check_user_time_layout(self) -> None:
+        data = check_user_time_data(uid=0x01020304, lock_flag_pos=0x0A0B0C)
+        assert len(data) == 17
+        assert data[0:5] == bytes([0, 1, 31, 14, 0])  # default start 0001311400
+        assert data[5:10] == bytes([99, 11, 30, 14, 0])  # default end 9911301400
+        assert data[10:13] == bytes([0x0A, 0x0B, 0x0C])  # lockFlagPos, 3 BE
+        assert data[13:17] == bytes([0x01, 0x02, 0x03, 0x04])  # uid, 4 BE
+
+    def test_check_admin_layout(self) -> None:
+        data = check_admin_data(admin_ps="305419896", uid=0x11223344, lock_flag_pos=7)
+        assert len(data) == 11
+        assert data[0:4] == (305419896).to_bytes(4, "big")  # 0x12345678
+        assert data[4:7] == bytes([0, 0, 7])
+        assert data[7:11] == bytes([0x11, 0x22, 0x33, 0x44])
+
+    def test_check_random_folds_in_unlock_key(self) -> None:
+        assert check_random_data(token=1000, unlock_key="2345") == (3345).to_bytes(
+            4, "big"
+        )
+
+    def test_check_random_wraps_mod_2_32(self) -> None:
+        assert check_random_data(token=0xFFFFFFFF, unlock_key=2) == (1).to_bytes(
+            4, "big"
+        )
+
+
+class TestControlPayload:
+    """The 8-byte UNLOCK/LOCK body: folded secret then epoch seconds."""
+
+    def test_layout(self) -> None:
+        data = control_data(token=1000, unlock_key="2345", epoch_seconds=0x5E0BE100)
+        assert len(data) == 8
+        assert data[0:4] == (3345).to_bytes(4, "big")
+        assert data[4:8] == (0x5E0BE100).to_bytes(4, "big")
+
+    def test_folded_secret_wraps(self) -> None:
+        data = control_data(token=0xFFFFFFFF, unlock_key=5, epoch_seconds=1)
+        assert data[0:4] == (4).to_bytes(4, "big")
+
+
+class TestTokenFromResponse:
+    """Reading psFromLock / the admin token, refusing anything unproven."""
+
+    def test_reads_token_on_success(self) -> None:
+        # envelope [cmd_echo, status=0x01] then the 4-byte token.
+        payload = bytes([0x55, 0x01, 0xDE, 0xAD, 0xBE, 0xEF])
+        assert token_from_response(payload) == 0xDEADBEEF
+
+    def test_rejects_failure_status(self) -> None:
+        with pytest.raises(ProtocolError):
+            token_from_response(bytes([0x55, 0x00, 0xDE, 0xAD, 0xBE, 0xEF]))
+
+    def test_rejects_short_reply(self) -> None:
+        with pytest.raises(ProtocolError):
+            token_from_response(bytes([0x55, 0x01, 0xDE, 0xAD]))

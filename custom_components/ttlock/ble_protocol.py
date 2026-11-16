@@ -25,6 +25,7 @@ import base64
 import binascii
 from dataclasses import dataclass
 from enum import IntEnum
+import time
 
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -75,6 +76,21 @@ class Command(IntEnum):
 
     QUERY_LOCK_STATUS = 20
     """Read locked/unlocked state - the local equivalent of a cloud poll."""
+
+    CHECK_USER_TIME = 0x55
+    """Prove a key is valid now; the reply carries the psFromLock token."""
+
+    CHECK_ADMIN = 0x41
+    """Prove we hold the admin password; gates every settings change."""
+
+    CHECK_RANDOM = 0x30
+    """Finish the admin handshake by echoing (token + unlockKey)."""
+
+    UNLOCK = 0x47
+    """Throw the bolt open, authenticated with psFromLock + unlockKey."""
+
+    LOCK = 0x58
+    """Throw the bolt closed; same authentication as UNLOCK."""
 
     RESPONSE = 84
     """Generic acknowledgement wrapper the lock replies with."""
@@ -652,3 +668,183 @@ def feature_value_bytes(feature_value: str) -> bytes:
     if len(raw) != 8:
         return b""
     return raw[4:] + raw[:4]
+
+
+# --- Password-field decoding -------------------------------------------------
+#
+# The cloud returns `lockKey` (the per-key unlockKey) and `adminPwd` not as
+# plain numbers but obfuscated: base64 of a comma-separated list of the encoded
+# bytes' decimal values, each byte then XORed by a constant recovered from the
+# payload's own last byte through a fixed 256-entry table. `aesKeyStr` is NOT
+# encoded this way - `parse_aes_key` handles it.
+#
+# Provenance: the table and the one-byte-XOR scheme are the wire encoding of a
+# credential field - an interface fact, like the CRC table and the opcodes -
+# read from the public references and reproduced here, not copied. As with the
+# rest of this module, nothing here logs.
+
+_PASSWORD_CODEC_TABLE = bytes.fromhex(
+    "005ebce2613fdd83c29c7e20a3fd1f419dc3217ffca2401e5f01e3bd3e6082dc"
+    "23079fc1421cfea0e1bf5d0380de3c62bee0025cdf81633d7c22c09e1d43a1ff"
+    "4618faa427799bc584da3866e5bb5907db856739bae406581947a5fb7826c49a"
+    "653bd987045ab8e6a7f91b45c6987a24f8a6441a99c7257b3a6486d85b05e7b9"
+    "8cd2306eedb3510f4e10f2ac2f7193cd114fadf3702ecc92d38d6f31b2ec0e50"
+    "aff1134dce90722c6d33d18f0c52b0ee326c8ed0530defb1f0ae4c1291cf2d73"
+    "ca947628abf517490856b4ea6937d58b5709ebb536688ad495cb2977f4aa4816"
+    "e9b7550b88d6346a2b7597c94a14f6a8742ac896154ba9f7b6e80a54d7896b35"
+)
+
+# A field this short is already plain - the official client's own guard.
+_PASSWORD_PLAIN_MAX = 10
+
+
+def decode_password(field: str) -> str:
+    """Decode a cloud `lockKey` / `adminPwd` field into its numeric string.
+
+    Short fields are already plain and returned unchanged. Otherwise:
+    base64-decode to a CSV of decimal byte values, XOR every byte but the last
+    by `table[(len - 1) % 256] ^ last_byte`, and read the result as text.
+
+    Raises:
+        ValueError: if the field is not the expected base64-of-CSV shape, so a
+            wrong encoding fails loudly rather than yielding silent garbage
+            that would then be sent to the lock as a key.
+    """
+    if not field or len(field) <= _PASSWORD_PLAIN_MAX:
+        return field
+    try:
+        csv = base64.b64decode(field).decode("ascii")
+        encoded = bytes(int(part) & 0xFF for part in csv.split(",") if part)
+    except (ValueError, binascii.Error) as err:
+        raise ValueError("password field is not base64 of a decimal-byte CSV") from err
+    if len(encoded) < 2:
+        return encoded.decode("latin1")
+    xor_const = _PASSWORD_CODEC_TABLE[(len(encoded) - 1) % 256] ^ encoded[-1]
+    return bytes(byte ^ xor_const for byte in encoded[:-1]).decode("latin1")
+
+
+# --- Authenticated control: session handshake, lock and unlock ---------------
+#
+# Reading state needs only the AES key. Changing state - the bolt, or any
+# setting - needs two more secrets lock/detail also returns:
+#
+#   unlockKey  (cloud field `lockKey`)  a per-key number, proves "this key"
+#   adminPs    (cloud field `adminPwd`) the admin password, gates settings
+#
+# both recovered by `decode_password`. Two flows use them:
+#
+#   lock / unlock : CHECK_USER_TIME -> psFromLock, then UNLOCK/LOCK carrying
+#                   (psFromLock + unlockKey) and a timestamp.
+#   any setting   : CHECK_ADMIN -> token, CHECK_RANDOM echoing
+#                   (token + unlockKey), then the setting command.
+#
+# psFromLock and the admin token are one wire shape - a 4-byte number the lock
+# hands back for us to fold the unlockKey into - so one parser reads both.
+
+# The validity window the official client sends for a permanent key: a start
+# in the past, an end far ahead, each five decimal-encoded bytes (yy mm dd HH
+# MM), so the lock's "valid now?" check passes.
+_PERMANENT_KEY_START = "0001311400"
+_PERMANENT_KEY_END = "9911301400"
+
+
+def decimal_time_bytes(digits: str) -> bytes:
+    """Pack a digit string two at a time into decimal-valued bytes.
+
+    "26" becomes byte 26 (0x1A), not 0x26: the lock reads each byte as a
+    decimal field of a yy/mm/dd/HH/MM date, so this is what its clock and
+    key-window checks expect. An odd-length string is left-padded.
+    """
+    if len(digits) % 2:
+        digits = "0" + digits
+    return bytes(int(digits[i : i + 2]) for i in range(0, len(digits), 2))
+
+
+def check_user_time_data(
+    uid: int = 0,
+    lock_flag_pos: int = 0,
+    start: str = _PERMANENT_KEY_START,
+    end: str = _PERMANENT_KEY_END,
+) -> bytes:
+    """Build the CHECK_USER_TIME payload: prove a key is valid right now.
+
+    17 bytes: a 5-byte start date, a 5-byte end date, the 3-byte lockFlagPos,
+    and the 4-byte account uid. The lock refuses a lockFlagPos below the one it
+    holds for the key (it reads as a reset key), so pass the key's own value.
+    """
+    return b"".join(
+        (
+            decimal_time_bytes(start),
+            decimal_time_bytes(end),
+            lock_flag_pos.to_bytes(3, "big"),
+            uid.to_bytes(4, "big"),
+        )
+    )
+
+
+def check_admin_data(
+    admin_ps: str | int, uid: int = 0, lock_flag_pos: int = 0
+) -> bytes:
+    """Build the CHECK_ADMIN payload: prove we hold the admin password.
+
+    11 bytes: the admin password as a 4-byte number, the 3-byte lockFlagPos,
+    then the 4-byte uid.
+    """
+    return b"".join(
+        (
+            int(admin_ps).to_bytes(4, "big"),
+            lock_flag_pos.to_bytes(3, "big"),
+            uid.to_bytes(4, "big"),
+        )
+    )
+
+
+def check_random_data(token: int, unlock_key: str | int) -> bytes:
+    """Build the CHECK_RANDOM payload: `(token + unlockKey) mod 2**32`, 4 BE.
+
+    Completes the admin handshake by folding our per-key secret into the number
+    the lock just handed back - the same proof the control payload carries.
+    """
+    return ((int(token) + int(unlock_key)) & 0xFFFFFFFF).to_bytes(4, "big")
+
+
+def control_data(
+    token: int, unlock_key: str | int, epoch_seconds: int | None = None
+) -> bytes:
+    """Build the UNLOCK / LOCK payload.
+
+    8 bytes: `(psFromLock + unlockKey) mod 2**32`, then the current time as
+    unix epoch seconds, both big-endian. The first proves the time-window check
+    passed and that we hold the key; the second stamps the lock's own log
+    record. `epoch_seconds` defaults to now and is provided for tests.
+    """
+    if epoch_seconds is None:
+        epoch_seconds = int(time.time())
+    return b"".join(
+        (
+            ((int(token) + int(unlock_key)) & 0xFFFFFFFF).to_bytes(4, "big"),
+            (epoch_seconds & 0xFFFFFFFF).to_bytes(4, "big"),
+        )
+    )
+
+
+def token_from_response(payload: bytes) -> int:
+    """Read the 4-byte token a CHECK_USER_TIME or CHECK_ADMIN reply carries.
+
+    Both answer with the response envelope then a 4-byte big-endian number -
+    `psFromLock` for the user check, the admin `token` for the admin check -
+    which the next command folds the unlockKey into.
+
+    Raises:
+        ProtocolError: if the lock did not report success, or the reply is too
+            short to hold the token, so a caller can never fold a garbage value
+            into the next command and send it to the bolt.
+    """
+    response = Response.parse(payload)
+    if not response.succeeded:
+        raise ProtocolError(f"Lock rejected the handshake: {payload.hex()}")
+    if len(response.data) < 4:
+        raise ProtocolError(
+            f"Handshake reply too short to hold a token: {payload.hex()}"
+        )
+    return int.from_bytes(response.data[:4], "big")
