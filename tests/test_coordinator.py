@@ -2204,3 +2204,58 @@ class TestBleFirstControl:
 
         ble_control.assert_not_called()
         cloud.assert_awaited_once()
+
+
+class TestBleCredentialCaching:
+    """BLE credentials persist across restarts so control survives a cloud outage.
+
+    lock/detail is the only cloud source of these; caching them means a lock in
+    Bluetooth range is driveable straight after a restart, and while the cloud
+    is unreachable entirely.
+    """
+
+    async def test_persists_after_a_detail_fetch(self, coordinator):
+        coordinator._ble_version = MOCK_LOCK_VERSION
+        coordinator._ble_key = MOCK_LOCK_AES_KEY
+        coordinator._ble_unlock_key = "2345"
+        coordinator._ble_lock_flag_pos = 3
+
+        await coordinator._persist_ble_credentials()
+
+        stored = await coordinator._store.async_get(coordinator.lock_id)
+        assert stored["ble_key"] == MOCK_LOCK_AES_KEY
+        assert stored["ble_version"] == MOCK_LOCK_VERSION
+        assert stored["ble_unlock_key"] == "2345"
+        assert stored["ble_lock_flag_pos"] == 3
+
+    async def test_restores_cached_credentials(self, coordinator):
+        await coordinator._store.async_update(
+            coordinator.lock_id,
+            ble_version=MOCK_LOCK_VERSION,
+            ble_key=MOCK_LOCK_AES_KEY,
+            ble_unlock_key="2345",
+            ble_lock_flag_pos=4,
+        )
+        coordinator._ble_key = None  # as it would be before any cloud fetch
+
+        await coordinator.async_restore_ble_credentials()
+
+        assert coordinator._ble_key == MOCK_LOCK_AES_KEY
+        assert coordinator._ble_version == MOCK_LOCK_VERSION
+        assert coordinator._ble_unlock_key == "2345"
+        assert coordinator._ble_lock_flag_pos == 4
+
+    async def test_restore_does_not_clobber_live_credentials(self, coordinator):
+        coordinator._ble_key = "live-key"
+        await coordinator._store.async_update(coordinator.lock_id, ble_key="stale-key")
+
+        await coordinator.async_restore_ble_credentials()
+
+        assert coordinator._ble_key == "live-key"
+
+    async def test_restore_is_a_noop_with_nothing_cached(self, coordinator):
+        coordinator._ble_key = None
+
+        await coordinator.async_restore_ble_credentials()
+
+        assert coordinator._ble_key is None

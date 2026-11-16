@@ -153,6 +153,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for summary in summaries
     ]
 
+    # Load any cached BLE credentials before the first cloud fetch, so a lock in
+    # Bluetooth range can be driven straight away and even if the cloud is down.
+    await asyncio.gather(
+        *(coordinator.async_restore_ble_credentials() for coordinator in locks)
+    )
+
     for coordinator in locks:
         entry.async_on_unload(coordinator.async_start_webhook_tracking())
         entry.async_on_unload(coordinator.async_start_ble_tracking())

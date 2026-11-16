@@ -633,6 +633,40 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
         self._ble_verified_at = dt_util.utcnow()
         return status
 
+    async def _persist_ble_credentials(self) -> None:
+        """Cache the BLE credentials so local control survives a cloud-less restart.
+
+        lock/detail is the only source of these and it needs the cloud, so
+        without a cache a restart while the cloud is unreachable would leave a
+        lock in Bluetooth range undriveable until the cloud came back. Written
+        to HA's .storage - the same trust boundary as the OAuth token already
+        kept there - and never logged.
+        """
+        await self._store.async_update(
+            self.lock_id,
+            ble_version=self._ble_version,
+            ble_key=self._ble_key,
+            ble_unlock_key=self._ble_unlock_key,
+            ble_lock_flag_pos=self._ble_lock_flag_pos,
+        )
+
+    async def async_restore_ble_credentials(self) -> None:
+        """Load cached BLE credentials at setup, before any cloud fetch.
+
+        Lets a lock be driven over Bluetooth straight after a restart, and when
+        the cloud is unreachable entirely. A later successful lock/detail
+        refreshes and re-persists them. No-op once they are already in memory.
+        """
+        if self._ble_key is not None:
+            return
+        stored = await self._store.async_get(self.lock_id)
+        if stored.get("ble_key") is None:
+            return
+        self._ble_version = stored.get("ble_version")
+        self._ble_key = stored.get("ble_key")
+        self._ble_unlock_key = stored.get("ble_unlock_key")
+        self._ble_lock_flag_pos = stored.get("ble_lock_flag_pos", 0)
+
     def _ble_control_credentials(
         self,
     ) -> tuple[LockVersion, bytes, str, int, int] | None:
@@ -723,6 +757,7 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
                 self._ble_key = details.aesKeyStr
                 self._ble_unlock_key = details.lockKey
                 self._ble_lock_flag_pos = details.lockFlagPos
+                await self._persist_ble_credentials()
                 self._details_last_fetched = now
 
             if Features.door_sensor in new_data.features:
